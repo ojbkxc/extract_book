@@ -352,7 +352,7 @@ def extract_page_items(page, page_num):
 
 
 def detect_title(item):
-    """检测标题类型：section/chapter/special/None"""
+    """检测标题类型：section/special/None（章标题改用页脚提取）"""
     text = item['text']
     sz = item['sz']
     bb = item['bbox']
@@ -360,9 +360,130 @@ def detect_title(item):
         return 'special'
     if is_section_title(text, sz, bb):
         return 'section'
-    if is_chapter_title(text, sz, bb):
-        return 'chapter'
     return None
+
+
+# ============================================================
+# 页脚章标题提取
+# ============================================================
+def _clean_footer_label(footer):
+    """清洗页脚标签：去除页码数字、噪声符号"""
+    text = footer
+    # 去除页码模式（如 "0 0 3", "0 1 0", "2 0" 等）
+    text = re.sub(r'\d\s*\d\s*\d', '', text)
+    text = re.sub(r'\d\s*\d(?=\s|$)', '', text)
+    # 去除末尾/开头的数字
+    text = re.sub(r'\d+\s*$', '', text)
+    text = re.sub(r'^\s*\d+', '', text)
+    # 去除孤立符号和ASCII噪声
+    text = re.sub(r'[■£E|S\]\[U!o]', '', text)
+    # 去除汉字间的单个数字（如"包3"→"包"）
+    text = re.sub(r'(?<=[\u4e00-\u9fff])\d+(?=[\u4e00-\u9fff\s])', '', text)
+    # 去除汉字间的单个ASCII字母噪声
+    text = re.sub(r'(?<=[\u4e00-\u9fff])[A-Za-z](?=[\u4e00-\u9fff])', '', text)
+    # 去除末尾的中文数字（OCR噪声，如"梦四"→"梦"）
+    text = re.sub(r'[一二三四五六七八九十]+$', '', text)
+    return text.strip()
+
+
+def _chapter_key(title):
+    """提取章标题的关键部分用于匹配：去除空格、中文数字前缀"""
+    t = title.replace(' ', '').replace('\u3000', '')
+    t = re.sub(r'^[一二三四五六七八九十]+', '', t)
+    return t
+
+
+def extract_footer_chapters(doc):
+    """从页脚提取章标题和书名
+
+    奇数页页脚格式: {章标题}{页码}
+    偶数页页脚格式: {页码}{书名}
+
+    返回:
+        page_chapters: {page_idx(0-based): chapter_key}
+        chapter_order: [chapter_key] 按首次出现顺序
+        book_name: str
+    """
+    raw_labels = {}  # page_idx → cleaned footer text
+    book_name = None
+
+    for i in range(doc.page_count):
+        page = doc[i]
+        d = page.get_text('dict')
+        footer_texts = []
+        for b in d['blocks']:
+            if b['type'] == 0:
+                bb = b['bbox']
+                if bb[1] > FOOT_Y_THRESHOLD:
+                    spans = [s for l in b['lines'] for s in l['spans']]
+                    text = ''.join(s['text'] for s in spans).strip()
+                    if text:
+                        footer_texts.append(text)
+        if not footer_texts:
+            continue
+        footer = ' '.join(footer_texts)
+
+        # 如果包含"柔石画传"→ 书名（偶数页）
+        if '柔石画传' in footer:
+            book_name = '柔石画传'
+            continue
+
+        # 清洗
+        cleaned = _clean_footer_label(footer)
+        if not cleaned or len(cleaned) < 4:
+            continue
+
+        raw_labels[i] = cleaned
+
+    # 模糊聚类归一化章标题
+    chapter_groups = []  # [(key, [page_indices])]
+    for page_idx in sorted(raw_labels.keys()):
+        label = raw_labels[page_idx]
+        key = _chapter_key(label)
+
+        matched = False
+        for grp in chapter_groups:
+            ratio = SequenceMatcher(None, key, grp[0]).ratio()
+            if ratio > 0.7:
+                grp[1].append(page_idx)
+                # 取更长的key作为代表
+                if len(key) > len(grp[0]):
+                    grp[0] = key
+                matched = True
+                break
+        if not matched:
+            chapter_groups.append([key, [page_idx]])
+
+    # 过滤噪声章标题
+    def _is_chapter_noise(key):
+        """检测是否是噪声章标题"""
+        # 中文字符占比<50%
+        if _chinese_ratio(key) < 0.5:
+            return True
+        # 匹配 SPECIAL_TITLES（这些在 build_catalog 中单独处理）
+        for st in SPECIAL_TITLES:
+            st_compact = st.replace(' ', '')
+            if st_compact in key or key in st_compact:
+                return True
+        # 含URL/价格关键词
+        if any(kw in key for kw in ['www', 'http', '定价', 'ISBN', '.com', '.cn', 'ewen']):
+            return True
+        return False
+
+    chapter_groups = [g for g in chapter_groups if not _is_chapter_noise(g[0]) and len(g[1]) >= 3]
+
+    # 按首次出现的页码排序
+    chapter_groups.sort(key=lambda g: g[1][0])
+
+    # 建立页→章key映射
+    page_chapters = {}
+    chapter_order = []
+    for key, page_indices in chapter_groups:
+        chapter_order.append(key)
+        for pi in page_indices:
+            page_chapters[pi] = key
+
+    return page_chapters, chapter_order, book_name
 
 
 # ============================================================
@@ -430,7 +551,15 @@ def process_pdf(pdf_path, output_dir):
     img_dir.mkdir(parents=True, exist_ok=True)
 
     doc = pymupdf.open(str(pdf_path))
-    book_name = pdf_path.stem  # 书名（从文件名提取）
+
+    # === 从页脚提取章标题和书名 ===
+    page_chapters, chapter_order, footer_book_name = extract_footer_chapters(doc)
+    book_name = footer_book_name if footer_book_name else pdf_path.stem
+    print(f'书名: {book_name}')
+    print(f'检测到 {len(chapter_order)} 个章标题:')
+    for idx, ck in enumerate(chapter_order):
+        cn = CN_NUMS[idx] if idx < len(CN_NUMS) else str(idx + 1)
+        print(f'  {cn} {ck}')
 
     # === 第一遍：检测所有标题，建立节结构 ===
     all_items = []  # (page_num, items)
@@ -462,9 +591,7 @@ def process_pdf(pdf_path, output_dir):
     ]
 
     # === 建立节列表 ===
-    # 节结构：[(start_page, end_page, title, level, title_item_idx)]
     sections_info = []
-    chapter_titles = []  # 章标题列表（层级2）
 
     for idx, (pg, it_idx, ttype, ttext) in enumerate(title_marks):
         if ttype in ('section', 'special'):
@@ -473,12 +600,6 @@ def process_pdf(pdf_path, output_dir):
                 'item_idx': it_idx,
                 'title': ttext,
                 'level': 3,
-            })
-        elif ttype == 'chapter':
-            chapter_titles.append({
-                'page': pg,
-                'item_idx': it_idx,
-                'title': ttext,
             })
 
     # 如果没有检测到任何节标题，将整个文档作为一个节
@@ -490,30 +611,15 @@ def process_pdf(pdf_path, output_dir):
             'level': 3,
         })
 
-    # === 为每个章标题匹配中文数字前缀 ===
-    # 章标题在正文中没有"一""二"前缀，从目录页或顺序推断
-    cn_num_chars = list('一二三四五六七八九十')
-    for idx, ch in enumerate(chapter_titles):
-        if idx < len(cn_num_chars):
-            ch['full_title'] = f'{cn_num_chars[idx]} {ch["title"]}'
-        else:
-            ch['full_title'] = ch['title']
-
     # === 第二遍：按节提取内容 ===
-    sections = []  # Section对象列表
+    sections = []  # [(sec_num, Section, page_idx)]
     current_section = None
-    current_chapter = None  # 当前章标题
     section_counter = 0
 
     # 建立页→节起始映射
-    section_starts = {}  # page → (item_idx, title, level)
+    section_starts = {}  # page → [section_info]
     for si in sections_info:
         section_starts.setdefault(si['page'], []).append(si)
-
-    # 建立页→章标题映射
-    chapter_starts = {}  # page → (item_idx, full_title)
-    for ch in chapter_titles:
-        chapter_starts.setdefault(ch['page'], []).append(ch)
 
     for i in range(doc.page_count):
         page = doc[i]
@@ -521,11 +627,6 @@ def process_pdf(pdf_path, output_dir):
 
         # 目录页：只处理节标题起始，跳过其他所有内容
         is_toc_page = i in toc_pages
-
-        # 检查是否有章标题
-        if i in chapter_starts:
-            for ch in chapter_starts[i]:
-                current_chapter = ch['full_title']
 
         # 检查是否有节标题
         new_sections_on_page = []
@@ -558,7 +659,7 @@ def process_pdf(pdf_path, output_dir):
                     sec_num = f'{section_counter:04d}'
                     current_section = Section(si['title'], level=3)
                     current_section.pages.append(i + 1)
-                    sections.append((sec_num, current_section, current_chapter))
+                    sections.append((sec_num, current_section, i))
                     section_started_this_page = True
                     is_new_section = True
                     break
@@ -588,10 +689,6 @@ def process_pdf(pdf_path, output_dir):
                 prev_img_bbox = item['bbox']
 
             elif item['type'] == 'text':
-                # 检查是否是章标题（跳过不输出）
-                ttype = detect_title(item)
-                if ttype == 'chapter':
-                    continue
 
                 # 检查是否是图片说明
                 if is_image_caption(item, prev_img_bbox):
@@ -633,7 +730,7 @@ def process_pdf(pdf_path, output_dir):
 
     # === 输出txt文件 ===
     print(f'\n=== 输出txt文件 ===')
-    for sec_num, section, chapter in sections:
+    for sec_num, section, page_idx in sections:
         txt_path = txt_dir / f'{sec_num}.txt'
         # 构建txt内容：首行标题，空行，然后内容
         lines = [section.title, '']
@@ -647,70 +744,112 @@ def process_pdf(pdf_path, output_dir):
 
     # === 生成目录.xlsx ===
     print(f'\n=== 生成目录.xlsx ===')
-    build_catalog(book_name, sections, chapter_titles, output_dir / '目录.xlsx')
+    build_catalog(book_name, sections, page_chapters, chapter_order, output_dir / '目录.xlsx')
 
     doc.close()
     print(f'\n完成！共 {len(sections)} 节, {sum(s[1].img_count for s in sections)} 张图片')
     return sections
 
 
-def build_catalog(book_name, sections, chapter_titles, out_path):
-    """生成目录.xlsx"""
+def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
+    """生成目录.xlsx
+
+    结构：书名(1) → 书名(2) → 前置特殊标题(3) → 目录(2)→(3) → 章(2)→节(3) → 后置特殊标题(2)→(3)
+    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = 'sheet1'
-
-    # 表头
     ws.append(['序号', '目录名', '层级', '整理后TXT'])
 
     row_num = 1
     # 层级1：书名
     ws.append([row_num, book_name, 1, None])
     row_num += 1
+    # 层级2：书名（重复）
+    ws.append([row_num, book_name, 2, None])
+    row_num += 1
 
-    # 建立章标题页码映射
-    chapter_by_page = {}
-    for ch in chapter_titles:
-        chapter_by_page[ch['page']] = ch['full_title']
+    # 分类节：前置、目录、正文（章→节）、后置
+    PRE_SPECIAL = ['龙华英烈画传系列丛书编委会', '出版说明']
+    POST_SPECIAL = ['柔石大事年表', '参考文献', '后记']
 
-    # 找到所有章的页码范围
-    chapter_ranges = []
-    sorted_chapters = sorted(chapter_titles, key=lambda x: x['page'])
-    for idx, ch in enumerate(sorted_chapters):
-        start = ch['page']
-        end = sorted_chapters[idx + 1]['page'] if idx + 1 < len(sorted_chapters) else 9999
-        chapter_ranges.append((start, end, ch['full_title']))
+    pre_sections = []
+    toc_section = None
+    body_sections = []
+    post_sections = []
 
-    # 为每个节找到所属的章
-    # sections: [(sec_num, Section, chapter_title)]
-    # 按章分组
-    current_chapter = None
-    chapters_output = {}  # chapter_title → [(sec_num, section)]
+    for sec_num, section, page_idx in sections:
+        title_compact = section.title.replace(' ', '').replace('\u3000', '')
+        is_pre = any(title_compact.startswith(ps.replace(' ', '')) for ps in PRE_SPECIAL)
+        is_post = any(title_compact.startswith(ps.replace(' ', '')) for ps in POST_SPECIAL)
+        is_toc = '目录' in title_compact
 
-    for sec_num, section, chapter in sections:
-        if chapter not in chapters_output:
-            chapters_output[chapter] = []
-        chapters_output[chapter].append((sec_num, section))
-
-    # 输出目录结构
-    for chapter_title, sec_list in chapters_output.items():
-        if chapter_title is None:
-            # 前置部分（没有章标题的节）
-            for sec_num, section in sec_list:
-                # 层级2
-                ws.append([row_num, section.title, 2, None])
-                row_num += 1
-                # 层级3
-                ws.append([row_num, section.title, 3, sec_num])
-                row_num += 1
+        if is_pre:
+            pre_sections.append((sec_num, section))
+        elif is_toc:
+            toc_section = (sec_num, section)
+        elif is_post:
+            post_sections.append((sec_num, section))
         else:
-            # 层级2：章标题
-            ws.append([row_num, chapter_title, 2, None])
+            body_sections.append((sec_num, section, page_idx))
+
+    # 输出前置特殊标题（层级3，在书名层级2下）
+    for sec_num, section in pre_sections:
+        ws.append([row_num, section.title, 3, sec_num])
+        row_num += 1
+
+    # 输出目录（层级2+3）
+    if toc_section:
+        sec_num, section = toc_section
+        ws.append([row_num, section.title, 2, None])
+        row_num += 1
+        ws.append([row_num, section.title, 3, sec_num])
+        row_num += 1
+
+    # 为正文节分配章：找到每个章的首次出现页，构建页码范围
+    chapter_first_page = {}
+    for pg in sorted(page_chapters.keys()):
+        key = page_chapters[pg]
+        if key not in chapter_first_page:
+            chapter_first_page[key] = pg
+
+    chapter_ranges = []
+    for idx, ch_key in enumerate(chapter_order):
+        start = chapter_first_page[ch_key]
+        if idx + 1 < len(chapter_order):
+            end = chapter_first_page[chapter_order[idx + 1]]
+        else:
+            end = 9999
+        chapter_ranges.append((start, end, ch_key))
+
+    # 为每个节找到所属章
+    sections_by_chapter = {}
+    for sec_num, section, page_idx in body_sections:
+        ch_key = None
+        for start, end, key in chapter_ranges:
+            if start <= page_idx < end:
+                ch_key = key
+                break
+        if ch_key:
+            sections_by_chapter.setdefault(ch_key, []).append((sec_num, section))
+
+    # 输出章→节（按chapter_order顺序）
+    for ch_idx, ch_key in enumerate(chapter_order):
+        if ch_key not in sections_by_chapter:
+            continue
+        cn = CN_NUMS[ch_idx] if ch_idx < len(CN_NUMS) else str(ch_idx + 1)
+        ws.append([row_num, f'{cn} {ch_key}', 2, None])
+        row_num += 1
+        for sec_num, section in sections_by_chapter[ch_key]:
+            ws.append([row_num, section.title, 3, sec_num])
             row_num += 1
-            # 层级3：节标题
-            for sec_num, section in sec_list:
-                ws.append([row_num, section.title, 3, sec_num])
-                row_num += 1
+
+    # 输出后置特殊标题（层级2+3）
+    for sec_num, section in post_sections:
+        ws.append([row_num, section.title, 2, None])
+        row_num += 1
+        ws.append([row_num, section.title, 3, sec_num])
+        row_num += 1
 
     # 设置列宽
     ws.column_dimensions['A'].width = 6
