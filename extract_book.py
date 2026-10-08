@@ -26,60 +26,97 @@ from openpyxl.styles import Font, Alignment
 from difflib import SequenceMatcher
 
 # ============================================================
-# 配置参数（基于 NH0633.pdf 探索结果）
+# 配置参数（默认值，实际运行时由 PdfConfig 自适应覆盖）
 # ============================================================
-PAGE_W = 1937.0
-PAGE_H = 2820.0
-
-# 页眉页脚过滤
-FOOT_Y_THRESHOLD = 2540.0   # y > 此值 → 页脚
-HEAD_Y_THRESHOLD = 200.0    # y < 此值 → 页眉
-RIGHT_EDGE_X = 1700.0       # x > 此值且宽度<100 → 右侧竖排装饰
-RIGHT_EDGE_MAX_W = 100.0
-
-# 全页背景图过滤
-FULLPAGE_W_RATIO = 0.95
-FULLPAGE_H_RATIO = 0.95
-
-# 节标题检测
-SECTION_MIN_SZ = 49.0       # 最小字号
-SECTION_MAX_WIDTH = 1000.0  # 最大宽度（排除正文长句）
-SECTION_MIN_LEN = 4
-SECTION_MAX_LEN = 30
-
-# 章扉页检测
-CHAPTER_MIN_SZ = 55.0       # 章标题最小字号
-CHAPTER_MAX_ITEMS = 6       # 章扉页最多文字block数
-
-# 图片说明
-IMG_CAPTION_MAX_SZ = 38.0   # 图片说明最大字号
-IMG_CAPTION_Y_GAP = 60.0    # 图片说明与图片底部的y差距
-
-# 小图片过滤（装饰性小图 / OCR碎片）
-IMG_MIN_W = 50.0            # 图片最小宽度
-IMG_MIN_H = 50.0            # 图片最小高度
-IMG_MIN_AREA = 50000.0      # 图片最小面积（过滤OCR文字碎片）
-IMG_MAX_RATIO = 8.0         # 最大宽高比（过滤文字行碎片）
-
-# OCR噪声过滤（正文46-50，图片说明35）
-NOISE_MIN_SZ = 28.0         # 文字最小字号（低于此视为OCR噪声）
-
-# 图片文字页检测（页面大部分文字字号远小于正文 → 整页截为图片）
-IMG_TEXT_BIG_SZ = 40.0      # 视为"正文文字"的字号阈值
-IMG_TEXT_BIG_RATIO = 0.2    # 正文文字占比低于此值 → 图片文字页
-
-# 特殊标题（前置/后置部分）
-SPECIAL_TITLES = [
-    '龙华英烈画传系列丛书编委会',
+# 通用特殊标题（大多数图书都有的前置/后置部分）
+COMMON_SPECIAL_TITLES = [
     '出版说明',
     '目录',
-    '柔石大事年表',
-    '参考文献',
+    '前言',
+    '序言',
+    '序',
     '后记',
+    '附录',
+    '参考文献',
+    '大事年表',
 ]
 
 # 中文数字（章标题前缀）
 CN_NUMS = '一二三四五六七八九十'
+
+
+class PdfConfig:
+    """PDF自适应配置：从实际PDF推断页面尺寸、字号分布等参数"""
+
+    def __init__(self, doc, special_titles=None):
+        self.special_titles = list(COMMON_SPECIAL_TITLES)
+        if special_titles:
+            self.special_titles.extend(special_titles)
+        self._analyze(doc)
+
+    def _analyze(self, doc):
+        # === 页面尺寸 ===
+        page0 = doc[0]
+        self.page_w = page0.rect.width
+        self.page_h = page0.rect.height
+
+        # === 字号分布统计（采样前50页）===
+        sz_counter = {}
+        for i in range(min(doc.page_count, 50)):
+            page = doc[i]
+            d = page.get_text('dict')
+            for b in d['blocks']:
+                if b['type'] == 0:
+                    for l in b['lines']:
+                        for s in l['spans']:
+                            sz = round(s['size'])
+                            sz_counter[sz] = sz_counter.get(sz, 0) + len(s['text'].strip())
+
+        # 最频繁的字号 = 正文字号
+        self.body_sz = max(sz_counter, key=sz_counter.get) if sz_counter else 50.0
+
+        # === 页眉页脚阈值（按页面高度比例）===
+        self.foot_y = self.page_h * 0.90
+        self.head_y = self.page_h * 0.07
+        self.right_edge_x = self.page_w * 0.88
+        self.right_edge_max_w = 100.0
+
+        # === 全页背景图 ===
+        self.fullpage_w_ratio = 0.95
+        self.fullpage_h_ratio = 0.95
+
+        # === 节标题检测 ===
+        self.section_min_sz = self.body_sz * 0.95
+        self.section_max_width = self.page_w * 0.52
+        self.section_min_len = 4
+        self.section_max_len = 30
+
+        # === 章扉页检测 ===
+        self.chapter_min_sz = self.body_sz * 1.1
+
+        # === 图片说明 ===
+        self.img_caption_max_sz = self.body_sz * 0.78
+        self.img_caption_y_gap = self.body_sz * 1.2
+
+        # === 小图片过滤 ===
+        self.img_min_w = 50.0
+        self.img_min_h = 50.0
+        self.img_min_area = (self.page_w * self.page_h) * 0.01  # 页面面积的1%
+        self.img_max_ratio = 8.0
+
+        # === OCR噪声过滤 ===
+        self.noise_min_sz = self.body_sz * 0.55
+
+        # === 图片文字页检测 ===
+        self.img_text_big_sz = self.body_sz * 0.82
+        self.img_text_big_ratio = 0.2
+
+        print(f'PDF自适应: 页面{self.page_w:.0f}×{self.page_h:.0f}, 正文字号{self.body_sz:.0f}')
+        print(f'  页脚阈值={self.foot_y:.0f}, 节标题字号≥{self.section_min_sz:.0f}, 噪声字号<{self.noise_min_sz:.0f}')
+
+
+# 全局配置（在 process_pdf 中初始化）
+_cfg = None
 
 
 # ============================================================
@@ -89,23 +126,23 @@ def is_fullpage_image(bbox):
     """检测全页背景图"""
     w = bbox[2] - bbox[0]
     h = bbox[3] - bbox[1]
-    return w > PAGE_W * FULLPAGE_W_RATIO and h > PAGE_H * FULLPAGE_H_RATIO
+    return w > _cfg.page_w * _cfg.fullpage_w_ratio and h > _cfg.page_h * _cfg.fullpage_h_ratio
 
 
 def is_footer(bbox):
     """检测页脚"""
-    return bbox[1] > FOOT_Y_THRESHOLD
+    return bbox[1] > _cfg.foot_y
 
 
 def is_header(bbox):
     """检测页眉"""
-    return bbox[3] < HEAD_Y_THRESHOLD
+    return bbox[3] < _cfg.head_y
 
 
 def is_right_edge_deco(bbox, text=''):
     """检测右侧竖排装饰文字（保留含'目录'的特殊标题）"""
     w = bbox[2] - bbox[0]
-    if bbox[0] > RIGHT_EDGE_X and w < RIGHT_EDGE_MAX_W:
+    if bbox[0] > _cfg.right_edge_x and w < _cfg.right_edge_max_w:
         if '目录' in text or '目 录' in text:
             return False
         return True
@@ -121,15 +158,15 @@ def _chinese_ratio(text):
 
 
 def is_section_title(text, max_sz, bbox):
-    """检测节标题：含'：' + 字号>49 + 宽度<1000 + 长度4-30 + 非数字开头; 中文字符占比>60%"""
+    """检测节标题：含'：' + 字号大 + 宽度合理 + 长度4-30 + 非数字开头; 中文字符占比>60%"""
     w = bbox[2] - bbox[0]
     if '：' not in text:
         return False
-    if max_sz < SECTION_MIN_SZ:
+    if max_sz < _cfg.section_min_sz:
         return False
-    if w > SECTION_MAX_WIDTH:
+    if w > _cfg.section_max_width:
         return False
-    if len(text) < SECTION_MIN_LEN or len(text) > SECTION_MAX_LEN:
+    if len(text) < _cfg.section_min_len or len(text) > _cfg.section_max_len:
         return False
     if text[0].isdigit():
         return False
@@ -164,14 +201,14 @@ def is_section_title(text, max_sz, bbox):
 
 def is_special_title(text, max_sz, bbox):
     """检测特殊标题（编委会、出版说明、目录、大事年表等）"""
-    if max_sz < 45:
+    if max_sz < _cfg.body_sz * 0.9:
         return False
     w = bbox[2] - bbox[0]
-    if w > 800:
+    if w > _cfg.page_w * 0.42:
         return False
     # 去除空格后模糊匹配
     text_compact = text.replace(' ', '').replace('\u3000', '')
-    for st in SPECIAL_TITLES:
+    for st in _cfg.special_titles:
         # 精确匹配或以特殊标题开头且剩余≤1字符（排除"后记》："等）
         if text_compact == st or (text_compact.startswith(st) and len(text_compact) <= len(st) + 1):
             return True
@@ -180,12 +217,12 @@ def is_special_title(text, max_sz, bbox):
 
 def is_chapter_title(text, max_sz, bbox):
     """检测章标题（章扉页上的大字号标题）"""
-    if max_sz < CHAPTER_MIN_SZ:
+    if max_sz < _cfg.chapter_min_sz:
         return False
     if len(text) < 4 or len(text) > 25:
         return False
     w = bbox[2] - bbox[0]
-    if w > 1000:
+    if w > _cfg.page_w * 0.52:
         return False
     # 排除含冒号的（那是节标题）
     if '：' in text:
