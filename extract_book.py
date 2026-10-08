@@ -29,7 +29,7 @@ from difflib import SequenceMatcher
 # 配置参数（默认值，实际运行时由 PdfConfig 自适应覆盖）
 # ============================================================
 # 通用特殊标题（大多数图书都有的前置/后置部分）
-COMMON_SPECIAL_TITLES = [
+COMMON__cfg.special_titles = [
     '出版说明',
     '目录',
     '前言',
@@ -49,7 +49,7 @@ class PdfConfig:
     """PDF自适应配置：从实际PDF推断页面尺寸、字号分布等参数"""
 
     def __init__(self, doc, special_titles=None):
-        self.special_titles = list(COMMON_SPECIAL_TITLES)
+        self.special_titles = list(COMMON__cfg.special_titles)
         if special_titles:
             self.special_titles.extend(special_titles)
         self._analyze(doc)
@@ -237,13 +237,13 @@ def is_image_caption(item, prev_img_bbox):
     """检测图片说明文字：字号小 + 在图片下方附近"""
     if prev_img_bbox is None:
         return False
-    if item['sz'] > IMG_CAPTION_MAX_SZ:
+    if item['sz'] > _cfg.img_caption_max_sz:
         return False
     # 文字在图片下方（y_start > img_y_end - 20）
     if item['bbox'][1] < prev_img_bbox[3] - 20:
         return False
     # 文字在图片下方不远（y_start < img_y_end + gap）
-    if item['bbox'][1] > prev_img_bbox[3] + IMG_CAPTION_Y_GAP:
+    if item['bbox'][1] > prev_img_bbox[3] + _cfg.img_caption_y_gap:
         return False
     return True
 
@@ -321,12 +321,12 @@ def extract_page_items(page, page_num):
                 continue
             iw = bb[2] - bb[0]
             ih = bb[3] - bb[1]
-            if iw < IMG_MIN_W or ih < IMG_MIN_H:
+            if iw < _cfg.img_min_w or ih < _cfg.img_min_h:
                 continue
-            if iw * ih < IMG_MIN_AREA:
+            if iw * ih < _cfg.img_min_area:
                 continue
             ratio = iw / ih if ih > 0 else 999
-            if ratio > IMG_MAX_RATIO or ratio < 1.0 / IMG_MAX_RATIO:
+            if ratio > _cfg.img_max_ratio or ratio < 1.0 / _cfg.img_max_ratio:
                 continue
             img_bboxes.append(bb)
         else:  # 文字block
@@ -343,15 +343,15 @@ def extract_page_items(page, page_num):
 
     # 检测图片文字页：页面大部分文字字号远小于正文 → 整页截为图片，不提取文字
     if len(raw_text) >= 5:
-        big = sum(1 for (_bb, _t, sz) in raw_text if sz >= IMG_TEXT_BIG_SZ)
-        if big / len(raw_text) < IMG_TEXT_BIG_RATIO:
+        big = sum(1 for (_bb, _t, sz) in raw_text if sz >= _cfg.img_text_big_sz)
+        if big / len(raw_text) < _cfg.img_text_big_ratio:
             all_bb = [bb for (bb, _t, _sz) in raw_text] + img_bboxes
             xs0 = [bb[0] for bb in all_bb]
             ys0 = [bb[1] for bb in all_bb]
             xs1 = [bb[2] for bb in all_bb]
             ys1 = [bb[3] for bb in all_bb]
             clip = (max(0.0, min(xs0) - 10), max(0.0, min(ys0) - 10),
-                    min(PAGE_W, max(xs1) + 10), min(PAGE_H, max(ys1) + 10))
+                    min(_cfg.page_w, max(xs1) + 10), min(_cfg.page_h, max(ys1) + 10))
             return [{
                 'type': 'img',
                 'bbox': clip,
@@ -363,7 +363,7 @@ def extract_page_items(page, page_num):
     items = []
     for (bb, text, max_sz) in raw_text:
         # 过滤小字号OCR噪声（如"HL""IW"等，正文46-50，图片说明35）
-        if max_sz < NOISE_MIN_SZ:
+        if max_sz < _cfg.noise_min_sz:
             continue
         # 过滤纯短ASCII噪声块（如"Bl""Ml""OSS"等）
         t_strip = text.replace(' ', '').replace('\u3000', '')
@@ -451,7 +451,7 @@ def extract_footer_chapters(doc):
         for b in d['blocks']:
             if b['type'] == 0:
                 bb = b['bbox']
-                if bb[1] > FOOT_Y_THRESHOLD:
+                if bb[1] > _cfg.foot_y:
                     spans = [s for l in b['lines'] for s in l['spans']]
                     text = ''.join(s['text'] for s in spans).strip()
                     if text:
@@ -497,8 +497,8 @@ def extract_footer_chapters(doc):
         # 中文字符占比<50%
         if _chinese_ratio(key) < 0.5:
             return True
-        # 匹配 SPECIAL_TITLES（这些在 build_catalog 中单独处理）
-        for st in SPECIAL_TITLES:
+        # 匹配 _cfg.special_titles（这些在 build_catalog 中单独处理）
+        for st in _cfg.special_titles:
             st_compact = st.replace(' ', '')
             if st_compact in key or key in st_compact:
                 return True
@@ -533,8 +533,8 @@ def extract_image(page, bbox, out_path):
     clip = pymupdf.Rect(
         max(0, clip.x0 - 2),
         max(0, clip.y0 - 2),
-        min(PAGE_W, clip.x1 + 2),
-        min(PAGE_H, clip.y1 + 2),
+        min(_cfg.page_w, clip.x1 + 2),
+        min(_cfg.page_h, clip.y1 + 2),
     )
     pix = page.get_pixmap(clip=clip, alpha=False)
     pix.save(str(out_path))
