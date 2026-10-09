@@ -17,12 +17,10 @@
 """
 
 import sys
-import os
 import re
 import pymupdf
 import openpyxl
 from pathlib import Path
-from openpyxl.styles import Font, Alignment
 from difflib import SequenceMatcher
 
 # ============================================================
@@ -44,17 +42,39 @@ COMMON_SPECIAL_TITLES = [
 # 中文数字（章标题前缀）
 CN_NUMS = '一二三四五六七八九十'
 
+_CN_DIGITS = '零一二三四五六七八九'
+
+
+def to_cn_num(n):
+    """将 1-99 的整数转换为中文数字
+
+    示例: 10→十, 11→十一, 20→二十, 99→九十九。
+    超出 1-99 支持范围时回退为阿拉伯数字字符串。
+    """
+    if n < 1:
+        return str(n)
+    if n < 10:
+        return _CN_DIGITS[n]
+    if n < 20:
+        return '十' + (_CN_DIGITS[n - 10] if n > 10 else '')
+    tens, ones = divmod(n, 10)
+    if tens >= 10:  # 超出 1-99 支持范围
+        return str(n)
+    if ones == 0:
+        return _CN_DIGITS[tens] + '十'
+    return _CN_DIGITS[tens] + '十' + _CN_DIGITS[ones]
+
 
 class PdfConfig:
     """PDF自适应配置：从实际PDF推断页面尺寸、字号分布等参数"""
 
-    def __init__(self, doc, special_titles=None):
+    def __init__(self, doc, special_titles=None, page_dicts=None):
         self.special_titles = list(COMMON_SPECIAL_TITLES)
         if special_titles:
             self.special_titles.extend(special_titles)
-        self._analyze(doc)
+        self._analyze(doc, page_dicts=page_dicts)
 
-    def _analyze(self, doc):
+    def _analyze(self, doc, page_dicts=None):
         # === 页面尺寸 ===
         page0 = doc[0]
         self.page_w = page0.rect.width
@@ -63,8 +83,7 @@ class PdfConfig:
         # === 字号分布统计（采样前50页）===
         sz_counter = {}
         for i in range(min(doc.page_count, 50)):
-            page = doc[i]
-            d = page.get_text('dict')
+            d = page_dicts[i] if page_dicts is not None else doc[i].get_text('dict')
             for b in d['blocks']:
                 if b['type'] == 0:
                     for l in b['lines']:
@@ -91,8 +110,6 @@ class PdfConfig:
         self.section_min_len = 4
         self.section_max_len = 30
 
-        # === 章扉页检测 ===
-        self.chapter_min_sz = self.body_sz * 1.1
 
         # === 图片说明 ===
         self.img_caption_max_sz = self.body_sz * 0.78
@@ -221,23 +238,6 @@ def is_special_title(text, max_sz, bbox):
     return False
 
 
-def is_chapter_title(text, max_sz, bbox):
-    """检测章标题（章扉页上的大字号标题）"""
-    if max_sz < _cfg.chapter_min_sz:
-        return False
-    if len(text) < 4 or len(text) > 25:
-        return False
-    w = bbox[2] - bbox[0]
-    if w > _cfg.page_w * 0.52:
-        return False
-    # 排除含冒号的（那是节标题）
-    if '：' in text:
-        return False
-    # 排除以数字开头的
-    if text[0].isdigit():
-        return False
-    return True
-
 
 def is_image_caption(item, prev_img_bbox):
     """检测图片说明文字：字号小 + 在图片下方附近"""
@@ -254,18 +254,27 @@ def is_image_caption(item, prev_img_bbox):
     return True
 
 
-def clean_text(text):
-    """清理文字：去除多余空格、OCR噪声"""
-    text = text.strip()
-    return text
-
 
 def clean_noise(text):
-    """去除OCR噪声：嵌入汉字间的短ASCII、孤立符号等"""
+    """去除OCR噪声：嵌入汉字间的短ASCII、孤立符号等
+
+    汉字之间的 1-3 个字母仅当为"单个字母"或"大小写混杂"（OCR噪声特征，
+    如 Ml/Bl/HL）时删除；全大写或全小写的字母串（如 WTO/GPS/DNA 术语）保留。
+    """
     if not text:
         return text
-    # 去除汉字之间的短ASCII噪声（1-3字母），如"缺 Ml乏"→"缺乏"
-    text = re.sub(r'(?<=[\u4e00-\u9fff])\s*[A-Za-z]{1,3}\s*(?=[\u4e00-\u9fff])', '', text)
+
+    def _drop_ocr_letter(m):
+        latin = m.group('latin')
+        # 全大写/全小写 → 视为术语，原样保留；单个字母或大小写混杂 → OCR噪声，删除
+        if len(latin) > 1 and (latin.isupper() or latin.islower()):
+            return m.group(0)
+        return ''
+
+    # 去除汉字之间的短ASCII噪声（1-3字母），如"缺 Ml乏"→"缺乏"，但保留"加入WTO后的影响"
+    text = re.sub(
+        r'(?<=[\u4e00-\u9fff])\s*(?P<latin>[A-Za-z]{1,3})\s*(?=[\u4e00-\u9fff])',
+        _drop_ocr_letter, text)
     # 去除行首紧邻汉字的短ASCII噪声，如"Bl 正学小学简介"→"正学小学简介"
     text = re.sub(r'^[A-Za-z]{1,3}\s+(?=[\u4e00-\u9fff])', '', text)
     # 去除连续符号噪声（如"■ ■"、"□□"）
@@ -315,9 +324,13 @@ def merge_image_bboxes(bboxes, gap=50.0):
     return boxes
 
 
-def extract_page_items(page, page_num):
-    """提取页面内容项，按y坐标排序（图片碎片自动合并）"""
-    d = page.get_text('dict')
+def extract_page_items(page, page_num, d=None):
+    """提取页面内容项，按y坐标排序（图片碎片自动合并）
+
+    d: 可选的已获取的 get_text('dict') 结果，避免同页重复解析。
+    """
+    if d is None:
+        d = page.get_text('dict')
     raw_text = []  # (bbox, text, max_sz)
     img_bboxes = []
     for b in d['blocks']:
@@ -436,7 +449,7 @@ def _chapter_key(title):
     return t
 
 
-def extract_footer_chapters(doc):
+def extract_footer_chapters(doc, page_dicts=None):
     """从页脚提取章标题和书名
 
     奇数页页脚格式: {章标题}{页码}
@@ -454,8 +467,7 @@ def extract_footer_chapters(doc):
     # 先收集所有页脚标签（清洗后）
     all_footer_labels = {}  # page_idx → cleaned label
     for i in range(doc.page_count):
-        page = doc[i]
-        d = page.get_text('dict')
+        d = page_dicts[i] if page_dicts is not None else doc[i].get_text('dict')
         footer_texts = []
         for b in d['blocks']:
             if b['type'] == 0:
@@ -524,8 +536,14 @@ def extract_footer_chapters(doc):
             st_compact = st.replace(' ', '')
             if st_compact in key or key in st_compact:
                 return True
-        # 含URL/价格关键词
-        if any(kw in key for kw in ['www', 'http', '定价', 'ISBN', '.com', '.cn', 'ewen']):
+        # 含URL/域名/价格等非正文关键词（通用判断，不依赖具体书名）
+        low = key.lower()
+        if any(kw in low for kw in ['www', 'http', '.com', '.cn', 'isbn']):
+            return True
+        if '定价' in key:
+            return True
+        # 含'.'（域名特征）
+        if '.' in key:
             return True
         return False
 
@@ -543,6 +561,149 @@ def extract_footer_chapters(doc):
             page_chapters[pi] = key
 
     return page_chapters, chapter_order, book_name
+
+
+# ============================================================
+# 目录页检测与章标题提取
+# ============================================================
+def _block_text(block):
+    """拼接一个文字 block 中所有 span 的文字"""
+    return ''.join(s['text'] for l in block['lines'] for s in l['spans'])
+
+
+def _page_is_toc(d, threshold=0.5):
+    """判断单页是否符合目录页特征：大部分文字 block 以页码数字结尾"""
+    total = 0
+    end_digit = 0
+    for b in d['blocks']:
+        if b['type'] != 0:
+            continue
+        bb = b['bbox']
+        if is_footer(bb) or is_header(bb):
+            continue
+        text = _block_text(b).strip()
+        if not text:
+            continue
+        total += 1
+        if re.search(r'\d\s*$', text):
+            end_digit += 1
+    return total > 0 and (end_digit / total) >= threshold
+
+
+def _is_toc_following_divider(d):
+    """判断目录列表之后紧随的章扉页/分隔页
+
+    特征：文字 block 极少（1-4）且总字符数很小，通常为竖排章名或纯图装饰。
+    这类页在手工整理时归入目录区、不参与正文提取，需并入目录页范围。
+    """
+    text_blocks = 0
+    text_chars = 0
+    for b in d['blocks']:
+        if b['type'] != 0:
+            continue
+        bb = b['bbox']
+        if is_footer(bb) or is_header(bb):
+            continue
+        t = _block_text(b).strip()
+        if t:
+            text_blocks += 1
+            text_chars += len(t)
+    return 1 <= text_blocks <= 4 and text_chars <= 40
+
+
+def detect_toc_pages(doc, page_dicts=None):
+    """动态检测目录页范围（返回 0-based 页码集合）
+
+    规则：从含"目录"标题的页开始，连续满足"大部分文字 block 以页码数字结尾"
+    的页视为目录页；遇到首个不满足的页即停止。若停止处恰为紧随目录的章扉页/
+    分隔页（文字极少），一并纳入目录区后再停止。
+    """
+    toc_pages = set()
+    started = False
+    i = 0
+    n = doc.page_count
+    while i < n:
+        d = page_dicts[i] if page_dicts is not None else doc[i].get_text('dict')
+        if not started:
+            for b in d['blocks']:
+                if b['type'] != 0:
+                    continue
+                compact = _block_text(b).replace(' ', '').replace('\u3000', '').strip()
+                if compact == '目录':
+                    started = True
+                    toc_pages.add(i)
+                    break
+            i += 1
+            continue
+        if _page_is_toc(d):
+            toc_pages.add(i)
+            i += 1
+            continue
+        # 目录列表结束：紧随的章扉页/分隔页并入目录区，然后停止
+        if _is_toc_following_divider(d):
+            toc_pages.add(i)
+        break
+    return toc_pages
+
+
+# 目录行清洗正则
+_TOC_PAGE_NUM_RE = re.compile(r'[\s。.、]+\d[\d\s。.、]*$')
+_TOC_SYMBOL_NOISE_RE = re.compile(r'\s*[\^■□▪▫▲△◆◇※]+\s*\d*')
+_TOC_SHORT_ASCII_RE = re.compile(r'(?:(?<=[\u4e00-\u9fff])|\s)[A-Za-z]{1,4}(?![A-Za-z])')
+
+
+def _clean_toc_line(text):
+    """清洗目录行：去除末尾页码与 OCR 噪声"""
+    t = text.strip()
+    t = _TOC_PAGE_NUM_RE.sub('', t)       # 去除末尾页码（含空格分隔，如 " 1 15"）
+    t = re.sub(r'\d{1,4}\s*$', '', t)     # 兜底：去除紧贴的末尾数字
+    t = _TOC_SYMBOL_NOISE_RE.sub('', t)   # 去除 ^■9 等符号噪声
+    t = _TOC_SHORT_ASCII_RE.sub('', t)    # 去除 " It" 等短 ASCII 噪声
+    return t.strip()
+
+
+def extract_toc_chapters(doc, toc_pages, page_dicts=None):
+    """从目录页提取有序的章标题文字列表
+
+    章标题判定：去除末尾页码后，不含中文冒号"："、不属于 special_titles、
+    中文字符占比 >= 0.6、长度 4-30；再用 _chapter_key 去掉中文数字前缀。
+    """
+    chapters = []
+    seen = set()
+    for i in sorted(toc_pages):
+        d = page_dicts[i] if page_dicts is not None else doc[i].get_text('dict')
+        for b in d['blocks']:
+            if b['type'] != 0:
+                continue
+            bb = b['bbox']
+            if is_footer(bb) or is_header(bb):
+                continue
+            text = _clean_toc_line(_block_text(b))
+            if not text:
+                continue
+            # 含中文冒号 → 节标题，排除
+            if '：' in text:
+                continue
+            # 属于特殊标题，排除
+            compact = text.replace(' ', '').replace('\u3000', '')
+            is_special = False
+            for st in _cfg.special_titles:
+                stc = st.replace(' ', '')
+                if compact == stc or (compact.startswith(stc) and len(compact) <= len(stc) + 1):
+                    is_special = True
+                    break
+            if is_special:
+                continue
+            if _chinese_ratio(text) < 0.6:
+                continue
+            if len(text) < 4 or len(text) > 30:
+                continue
+            key = _chapter_key(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            chapters.append(key)
+    return chapters
 
 
 # ============================================================
@@ -615,31 +776,64 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
     txt_dir.mkdir(parents=True, exist_ok=True)
     img_dir.mkdir(parents=True, exist_ok=True)
 
+    # 清空输出目录的旧文件，避免重复运行时残留（批量场景尤为重要）
+    for _d in (txt_dir, img_dir):
+        for _f in _d.iterdir():
+            if _f.is_file():
+                _f.unlink()
+    _old_xlsx = output_dir / '目录.xlsx'
+    if _old_xlsx.exists():
+        _old_xlsx.unlink()
+
     doc = pymupdf.open(str(pdf_path))
+
+    # === 预取每页文字结构，供多处复用（性能优化）===
+    page_dicts = [doc[i].get_text('dict') for i in range(doc.page_count)]
 
     # === 初始化自适应配置 ===
     global _cfg
-    _cfg = PdfConfig(doc, special_titles=special_titles)
+    _cfg = PdfConfig(doc, special_titles=special_titles, page_dicts=page_dicts)
 
-    # === 从页脚提取章标题和书名 ===
-    page_chapters, chapter_order, footer_book_name = extract_footer_chapters(doc)
+    # === 扫描件/无文字层检测 ===
+    total_chars = sum(
+        len(s['text'])
+        for d in page_dicts
+        for b in d['blocks'] if b['type'] == 0
+        for l in b['lines'] for s in l['spans']
+    )
+    if total_chars < 100:
+        print('  [警告] 全文文字总字符数过少(<100)，可能为扫描件或无文字层，提取结果可能为空')
+
+    # === 动态检测目录页范围 ===
+    toc_pages = detect_toc_pages(doc, page_dicts)
+    if toc_pages:
+        print(f'检测到目录页: 第 {min(toc_pages) + 1}-{max(toc_pages) + 1} 页')
+
+    # === 从页脚提取章标题（用于节归属）和书名 ===
+    page_chapters, chapter_order, footer_book_name = extract_footer_chapters(doc, page_dicts)
     book_name = footer_book_name if footer_book_name else pdf_path.stem
     print(f'书名: {book_name}')
-    print(f'检测到 {len(chapter_order)} 个章标题:')
-    for idx, ck in enumerate(chapter_order):
-        cn = CN_NUMS[idx] if idx < len(CN_NUMS) else str(idx + 1)
-        print(f'  {cn} {ck}')
+
+    # === 从目录页提取章标题（主方案，显示文字）===
+    toc_chapters = extract_toc_chapters(doc, toc_pages, page_dicts)
+    if len(toc_chapters) >= 2 and len(toc_chapters) == len(chapter_order):
+        display_chapters = toc_chapters
+    else:
+        display_chapters = chapter_order
+        if len(toc_chapters) >= 2:
+            print(f'  [提示] 目录章标题数({len(toc_chapters)})与页脚章数({len(chapter_order)})不一致，回退用页脚章标题')
+
+    print(f'检测到 {len(display_chapters)} 个章标题:')
+    for idx, ck in enumerate(display_chapters):
+        print(f'  {to_cn_num(idx + 1)} {ck}')
 
     # === 第一遍：检测所有标题，建立节结构 ===
     all_items = []  # (page_num, items)
     title_marks = []  # (page_num, item_index, title_type, title_text)
 
-    # 目录页范围（检测到"目录"标题后，跳过后续目录页的节标题检测）
-    toc_pages = set()
-
     for i in range(doc.page_count):
         page = doc[i]
-        items = extract_page_items(page, i + 1)
+        items = extract_page_items(page, i + 1, page_dicts[i])
         all_items.append(items)
         for j, item in enumerate(items):
             if item['type'] == 'text':
@@ -647,10 +841,6 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
                 if ttype:
                     title_text = normalize_title(item['text'])
                     title_marks.append((i, j, ttype, title_text))
-                    # 检测到"目录"标题 → 标记后续4页为目录页
-                    if ttype == 'special' and '目录' in title_text.replace(' ', ''):
-                        for k in range(i, min(i + 5, doc.page_count)):
-                            toc_pages.add(k)
 
     # 过滤掉目录页内的所有标题（保留"目录"标题本身作为节）
     title_marks = [
@@ -706,7 +896,7 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
         # 处理页面items
         para_buffer = []  # 当前段落缓冲（同页连续文字block合并）
         prev_img_bbox = None
-        section_started_this_page = False
+
 
         for j, item in enumerate(items):
             # 目录页：跳过所有非节标题起始的内容
@@ -729,7 +919,7 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
                     current_section = Section(si['title'], level=3)
                     current_section.pages.append(i + 1)
                     sections.append((sec_num, current_section, i))
-                    section_started_this_page = True
+
                     is_new_section = True
                     break
 
@@ -767,8 +957,11 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
                     prev_img_bbox = None
                     continue
 
+                # 重新检测本 item 的标题类型（不要使用第一遍循环残留的 ttype 变量）
+                ttype2 = detect_title(item)
+
                 # 检查是否是特殊标题（已作为节标题处理）
-                if ttype == 'special':
+                if ttype2 == 'special':
                     # 如果不是节起始，跳过
                     is_start = False
                     for si in new_sections_on_page:
@@ -781,7 +974,7 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
                     continue
 
                 # 检查是否是节标题（已作为节起始处理）
-                if ttype == 'section':
+                if ttype2 == 'section':
                     continue
 
                 # 普通文字
@@ -813,17 +1006,19 @@ def process_pdf(pdf_path, output_dir, special_titles=None):
 
     # === 生成目录.xlsx ===
     print(f'\n=== 生成目录.xlsx ===')
-    build_catalog(book_name, sections, page_chapters, chapter_order, output_dir / '目录.xlsx')
+    build_catalog(book_name, sections, page_chapters, chapter_order, display_chapters, output_dir / '目录.xlsx')
 
     doc.close()
     print(f'\n完成！共 {len(sections)} 节, {sum(s[1].img_count for s in sections)} 张图片')
     return sections
 
 
-def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
+def build_catalog(book_name, sections, page_chapters, chapter_order, chapter_titles, out_path):
     """生成目录.xlsx
 
     结构：书名(1) → 书名(2) → 前置特殊标题(3) → 目录(2)→(3) → 章(2)→节(3) → 后置特殊标题(2)→(3)
+
+    chapter_titles: 章标题显示文字列表（与 chapter_order 顺序一一对应）。
     """
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -839,13 +1034,20 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
     row_num += 1
 
     # 分类节：前置、目录、正文（章→节）、后置
-    # 根据页码位置和特殊标题列表自动分类
-    if page_chapters:
+    # 有章：按页码位置分类；无章：按特殊标题名称分类
+    has_chapters = bool(page_chapters)
+    if has_chapters:
         first_chapter_page = min(page_chapters.keys())
         last_chapter_page = max(page_chapters.keys())
     else:
-        first_chapter_page = 9999
+        first_chapter_page = 0
         last_chapter_page = 0
+
+    # 无章书中判定为"后置"的特殊标题关键词
+    post_keywords = ('后记', '附录', '参考文献', '大事年表')
+
+    def _is_post_title(title_compact):
+        return any(kw in title_compact for kw in post_keywords)
 
     pre_sections = []
     toc_section = None
@@ -862,6 +1064,12 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
 
         if is_toc:
             toc_section = (sec_num, section)
+        elif is_special and not has_chapters:
+            # 无章书：按名称判断前置/后置
+            if _is_post_title(title_compact):
+                post_sections.append((sec_num, section))
+            else:
+                pre_sections.append((sec_num, section))
         elif is_special and page_idx < first_chapter_page:
             pre_sections.append((sec_num, section))
         elif is_special and page_idx > last_chapter_page:
@@ -909,12 +1117,13 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
         if ch_key:
             sections_by_chapter.setdefault(ch_key, []).append((sec_num, section))
 
-    # 输出章→节（按chapter_order顺序）
+    # 输出章→节（章标题显示文字优先用目录标题，前缀按顺序重新分配）
     for ch_idx, ch_key in enumerate(chapter_order):
         if ch_key not in sections_by_chapter:
             continue
-        cn = CN_NUMS[ch_idx] if ch_idx < len(CN_NUMS) else str(ch_idx + 1)
-        ws.append([row_num, f'{cn} {ch_key}', 2, None])
+        cn = to_cn_num(ch_idx + 1)
+        display = chapter_titles[ch_idx] if ch_idx < len(chapter_titles) else ch_key
+        ws.append([row_num, f'{cn} {display}', 2, None])
         row_num += 1
         for sec_num, section in sections_by_chapter[ch_key]:
             ws.append([row_num, section.title, 3, sec_num])
@@ -940,18 +1149,50 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
 # ============================================================
 # 入口
 # ============================================================
+def _process_directory(dir_path, special_titles=None):
+    """批量处理目录下所有 *.pdf，逐个输出到 <目录>/<pdf文件名> 子目录"""
+    pdfs = sorted(dir_path.glob('*.pdf'))
+    if not pdfs:
+        print(f'目录下未找到 PDF 文件: {dir_path}')
+        return
+    print(f'批量处理: {dir_path}（共 {len(pdfs)} 个PDF）')
+    ok = 0
+    for idx, pdf in enumerate(pdfs, 1):
+        out_dir = dir_path / pdf.stem
+        print(f'\n===== [{idx}/{len(pdfs)}] {pdf.name} → {out_dir} =====')
+        try:
+            process_pdf(pdf, out_dir, special_titles=special_titles)
+            ok += 1
+        except Exception as e:
+            print(f'  [错误] 处理 {pdf.name} 失败: {e}')
+    print(f'\n批量处理完成: 成功 {ok}/{len(pdfs)}')
+
+
 def main():
     if len(sys.argv) < 2:
-        print('用法: python extract_book.py <pdf路径> [输出目录] [特殊标题1,特殊标题2,...]')
-        print('示例: python extract_book.py NH0633.pdf 柔石画传')
+        print('用法:')
+        print('  单文件: python extract_book.py <pdf路径> [输出目录] [特殊标题1,特殊标题2,...]')
+        print('  批量:   python extract_book.py <目录> [特殊标题1,特殊标题2,...]')
         print('示例: python extract_book.py NH0633.pdf 柔石画传 "龙华英烈画传系列丛书编委会,柔石大事年表"')
+        print('示例: python extract_book.py ./books')
         sys.exit(1)
 
+    first = Path(sys.argv[1])
+
+    # 批量模式：第一个参数为目录
+    if first.is_dir():
+        special_titles = None
+        if len(sys.argv) >= 3:
+            special_titles = [s.strip() for s in sys.argv[2].split(',') if s.strip()]
+        _process_directory(first, special_titles)
+        return
+
+    # 单文件模式（保持兼容）
     pdf_path = sys.argv[1]
     if len(sys.argv) >= 3:
         output_dir = sys.argv[2]
     else:
-        output_dir = Path(pdf_path).stem
+        output_dir = first.stem
 
     # 可选：额外特殊标题（逗号分隔）
     special_titles = None
