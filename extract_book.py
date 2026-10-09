@@ -29,7 +29,7 @@ from difflib import SequenceMatcher
 # 配置参数（默认值，实际运行时由 PdfConfig 自适应覆盖）
 # ============================================================
 # 通用特殊标题（大多数图书都有的前置/后置部分）
-COMMON__cfg.special_titles = [
+COMMON_SPECIAL_TITLES = [
     '出版说明',
     '目录',
     '前言',
@@ -49,7 +49,7 @@ class PdfConfig:
     """PDF自适应配置：从实际PDF推断页面尺寸、字号分布等参数"""
 
     def __init__(self, doc, special_titles=None):
-        self.special_titles = list(COMMON__cfg.special_titles)
+        self.special_titles = list(COMMON_SPECIAL_TITLES)
         if special_titles:
             self.special_titles.extend(special_titles)
         self._analyze(doc)
@@ -86,7 +86,7 @@ class PdfConfig:
         self.fullpage_h_ratio = 0.95
 
         # === 节标题检测 ===
-        self.section_min_sz = self.body_sz * 0.95
+        self.section_min_sz = self.body_sz + 2  # 正文字号+2（节标题字号略高于正文）
         self.section_max_width = self.page_w * 0.52
         self.section_min_len = 4
         self.section_max_len = 30
@@ -179,11 +179,17 @@ def is_section_title(text, max_sz, bbox):
     # 排除以句号/感叹号结尾的正文句子（不排除引号——节标题常含引号）
     if text[-1] in '。！':
         return False
+    # 排除以引号结尾且引号前是句号/感叹号的（如"...执行！""）
+    if text[-1] in '”"』』' and len(text) >= 2 and text[-2] in '。！':
+        return False
     # 冒号前后部分
     parts = text.split('：', 1)
     prefix = parts[0]
     suffix = parts[1] if len(parts) > 1 else ''
     if len(prefix) < 1 or len(prefix) > 8:
+        return False
+    # 排除前缀含逗号的（如"的信中，他写道："是正文，节标题前缀不含逗号）
+    if '，' in prefix or ',' in prefix:
         return False
     # 排除前缀含书名号》但不含《的（如"后记》："是正文引用，但"《疯人》"是节标题）
     if '》' in prefix and '《' not in prefix:
@@ -436,14 +442,17 @@ def extract_footer_chapters(doc):
     奇数页页脚格式: {章标题}{页码}
     偶数页页脚格式: {页码}{书名}
 
+    书名通过频率统计自动识别（在大量页中反复出现的相同文字）
+
     返回:
         page_chapters: {page_idx(0-based): chapter_key}
         chapter_order: [chapter_key] 按首次出现顺序
         book_name: str
     """
-    raw_labels = {}  # page_idx → cleaned footer text
-    book_name = None
+    from collections import Counter
 
+    # 先收集所有页脚标签（清洗后）
+    all_footer_labels = {}  # page_idx → cleaned label
     for i in range(doc.page_count):
         page = doc[i]
         d = page.get_text('dict')
@@ -459,18 +468,31 @@ def extract_footer_chapters(doc):
         if not footer_texts:
             continue
         footer = ' '.join(footer_texts)
-
-        # 如果包含"柔石画传"→ 书名（偶数页）
-        if '柔石画传' in footer:
-            book_name = '柔石画传'
-            continue
-
-        # 清洗
         cleaned = _clean_footer_label(footer)
-        if not cleaned or len(cleaned) < 4:
-            continue
+        if cleaned and len(cleaned) >= 2:
+            all_footer_labels[i] = cleaned
 
-        raw_labels[i] = cleaned
+    # 统计标签出现频率，自动识别书名（出现频率最高的标签）
+    label_counter = Counter(all_footer_labels.values())
+    total_pages = doc.page_count
+
+    book_name = None
+    book_name_label = None
+    for label, count in label_counter.most_common():
+        # 书名特征：在 >= 20% 的页中出现，且长度 >= 2
+        if count >= total_pages * 0.2 and len(label) >= 2:
+            book_name = label
+            book_name_label = label
+            break
+
+    # 章标题候选 = 排除书名页后的标签
+    raw_labels = {}
+    for page_idx, label in all_footer_labels.items():
+        if book_name_label and label == book_name_label:
+            continue
+        if len(label) < 4:
+            continue
+        raw_labels[page_idx] = label
 
     # 模糊聚类归一化章标题
     chapter_groups = []  # [(key, [page_indices])]
@@ -578,8 +600,14 @@ class Section:
 # ============================================================
 # 主处理逻辑
 # ============================================================
-def process_pdf(pdf_path, output_dir):
-    """主处理函数"""
+def process_pdf(pdf_path, output_dir, special_titles=None):
+    """主处理函数
+
+    Args:
+        pdf_path: PDF文件路径
+        output_dir: 输出目录
+        special_titles: 额外的特殊标题列表（如丛书编委会、大事年表等）
+    """
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
     txt_dir = output_dir / 'txt'
@@ -588,6 +616,10 @@ def process_pdf(pdf_path, output_dir):
     img_dir.mkdir(parents=True, exist_ok=True)
 
     doc = pymupdf.open(str(pdf_path))
+
+    # === 初始化自适应配置 ===
+    global _cfg
+    _cfg = PdfConfig(doc, special_titles=special_titles)
 
     # === 从页脚提取章标题和书名 ===
     page_chapters, chapter_order, footer_book_name = extract_footer_chapters(doc)
@@ -807,8 +839,13 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
     row_num += 1
 
     # 分类节：前置、目录、正文（章→节）、后置
-    PRE_SPECIAL = ['龙华英烈画传系列丛书编委会', '出版说明']
-    POST_SPECIAL = ['柔石大事年表', '参考文献', '后记']
+    # 根据页码位置和特殊标题列表自动分类
+    if page_chapters:
+        first_chapter_page = min(page_chapters.keys())
+        last_chapter_page = max(page_chapters.keys())
+    else:
+        first_chapter_page = 9999
+        last_chapter_page = 0
 
     pre_sections = []
     toc_section = None
@@ -817,15 +854,17 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
 
     for sec_num, section, page_idx in sections:
         title_compact = section.title.replace(' ', '').replace('\u3000', '')
-        is_pre = any(title_compact.startswith(ps.replace(' ', '')) for ps in PRE_SPECIAL)
-        is_post = any(title_compact.startswith(ps.replace(' ', '')) for ps in POST_SPECIAL)
         is_toc = '目录' in title_compact
+        is_special = any(
+            st.replace(' ', '') in title_compact or title_compact.startswith(st.replace(' ', ''))
+            for st in _cfg.special_titles
+        )
 
-        if is_pre:
-            pre_sections.append((sec_num, section))
-        elif is_toc:
+        if is_toc:
             toc_section = (sec_num, section)
-        elif is_post:
+        elif is_special and page_idx < first_chapter_page:
+            pre_sections.append((sec_num, section))
+        elif is_special and page_idx > last_chapter_page:
             post_sections.append((sec_num, section))
         else:
             body_sections.append((sec_num, section, page_idx))
@@ -903,8 +942,9 @@ def build_catalog(book_name, sections, page_chapters, chapter_order, out_path):
 # ============================================================
 def main():
     if len(sys.argv) < 2:
-        print('用法: python extract_book.py <pdf路径> [输出目录]')
+        print('用法: python extract_book.py <pdf路径> [输出目录] [特殊标题1,特殊标题2,...]')
         print('示例: python extract_book.py NH0633.pdf 柔石画传')
+        print('示例: python extract_book.py NH0633.pdf 柔石画传 "龙华英烈画传系列丛书编委会,柔石大事年表"')
         sys.exit(1)
 
     pdf_path = sys.argv[1]
@@ -913,10 +953,17 @@ def main():
     else:
         output_dir = Path(pdf_path).stem
 
+    # 可选：额外特殊标题（逗号分隔）
+    special_titles = None
+    if len(sys.argv) >= 4:
+        special_titles = [s.strip() for s in sys.argv[3].split(',') if s.strip()]
+
     print(f'PDF: {pdf_path}')
     print(f'输出目录: {output_dir}')
+    if special_titles:
+        print(f'额外特殊标题: {special_titles}')
 
-    process_pdf(pdf_path, output_dir)
+    process_pdf(pdf_path, output_dir, special_titles=special_titles)
 
 
 if __name__ == '__main__':
